@@ -1,0 +1,695 @@
+---
+title: "Advancing Forecasting in Psychology: A Tutorial and Illustration of a Novel Approach based on LSTM Neural Networks for Analyzing Longitudinal Data"
+author: "Nedderhoff"
+---
+
+## Preliminary: Load Libraries
+
+```{r}
+packages <- c("reticulate", "tidyverse", "ggplot2", "here", "keras", "tensorflow", "tfruns", "ggthemes")
+
+PackageManager <- function(x){
+  pkg_avail <- nzchar(system.file(package = x))
+
+  if(pkg_avail){
+  library(x, character.only = TRUE)
+}
+  else{install.packages(x)
+     library(x, character.only = TRUE)}
+}
+
+apply(as.matrix(packages), MARGIN = 1, FUN = PackageManager)
+
+system("Rscript 01_install_keras_tensorflow.R")
+
+set.seed(1)
+```
+
+## Step 1: Define Helper Functions
+
+```{r}
+MinMax_Scaler <- function(x, Min = NULL, Max = NULL){
+  if(is.null(c(Min, Max))){
+  Max <- max(x, na.rm = T)
+  Min <- min(x, na.rm = T)
+  }
+  if((Max - Min) != 0){
+  Scaled <- (x - Min) / (Max - Min)
+  }
+  else{
+  Scaled <- 0.5
+  }
+  return(Scaled)
+}
+
+Sequence_Splicer <- function(df, n_timepoints_in, c_iv, c_av, n_timepoints_out = 1) {
+  # Splits the multivariate time sequence
+  # Creating a list for both variables
+  IDs <- unique(df$ID)
+  t_p <- nrow(df[df$ID == IDs[1], ])
+
+  X <- array(0, dim = c(length(n_timepoints_in:(t_p-n_timepoints_out))*length(IDs), n_timepoints_in, ncol(df)-1))
+  y <- list()
+
+  for(p in 1:length(IDs)){
+    df_spliced <- df[df$ID == IDs[p], ]
+    y_p <- list()
+    for(i in 1:(nrow(df_spliced) - n_timepoints_in - n_timepoints_out + 1)){
+      lookback <- i + n_timepoints_in - 1
+      forecast <- lookback + n_timepoints_out
+      # Splitting the sequences into: x = past values and features, y = values ahead
+      seq_x <- df_spliced[i:lookback, c_iv, drop = FALSE]
+      seq_y <- df_spliced[(lookback+1):forecast, c_av, drop = FALSE]
+      array_indice <- i + (length(n_timepoints_in:(t_p-n_timepoints_out)) * (p - 1))
+      for(j in 1:ncol(seq_x)){
+        X[array_indice, , j] <- unlist(seq_x[, j])}
+      y_p[[i]] <- as.data.frame(t(seq_y))
+    }
+    y[[p]] <- y_p
+  }
+  
+
+  y <- as.array(as.matrix(bind_rows(y)))
+  
+  return(list(X, y))
+}
+
+r_squared <- function(y_true, y_pred){
+  rss <- sum((y_pred - mean(y_true))^2)
+  tss <- sum((y_true - mean(y_true))^2)
+
+  r2 <- (rss / tss)
+  return(r2)
+}
+
+r2_score <- custom_metric(name = "r2", 
+              metric_fn = r_squared)
+
+Build_LSTM <- function(Neurons, input_shape, lstm_layers, dense_layers, ActivationFunction = "tanh", recurrent_activation_function = "tanh", dropout_rate = 0.5, output_dimension = 3) {
+  
+  # Initiate Model
+  model <- keras_model_sequential()
+  
+  if(lstm_layers > 1){
+  # Add LSTM Layer
+  for(i in 1:(lstm_layers - 1)){
+    model %>% 
+      layer_lstm(units = Neurons, 
+                 activation = ActivationFunction, 
+                 recurrent_activation = recurrent_activation_function, 
+                 return_sequences = TRUE) %>%
+      layer_dropout(rate = dropout_rate)
+  }
+    
+    }
+  
+  # Last LSTM Layer
+  model %>%
+    layer_lstm(units = Neurons, 
+               activation = ActivationFunction,
+               recurrent_activation = recurrent_activation_function)
+  
+  # Add Dense Layer
+  for(i in 1:dense_layers){
+   model %>%
+      layer_dense(units = Neurons / 2)
+  }
+  
+  # Add Output Layer
+  model %>% 
+    layer_dense(units = output_dimension)
+  
+  # and compile model
+  model %>%
+    compile(optimizer = "adam",
+            loss = "mse", 
+            metrics = r2_score)
+
+return(model)
+}
+```
+
+## Step 2: Define Hyperparameters
+
+```{r}
+# Data Hyperparameters
+lookback_window <- 16
+Timepoints_to_forecast <- 8 
+
+# Model Hyperparameters
+Neurons <- 40 
+NoLSTMLayers <- 2
+NoDenseLayers <- 1
+BatchSize <- 16
+AF <- "relu" 
+Recurrent_AF <- "tanh"
+DropoutRate <- 0.5
+```
+
+## Step 3: Add Coding Scheme
+
+```{r}
+Path <- paste0(here(), "/01_data/CV_MT.csv")
+EMA_Data <- read.csv(Path, header = T)
+
+EMA_Data <- data.frame(ID = unique(EMA_Data$ID)) %>%
+  bind_cols(as.data.frame(contr.sum(69))) %>%
+  inner_join(EMA_Data)
+```
+
+## Step 4: Split Data into Train- and Test set
+
+```{r}
+# Train-Test Split
+Trainset <- EMA_Data %>% group_by(ID) %>% slice(1:48)
+Testset <- EMA_Data %>% group_by(ID) %>% slice(33:56) # consider the 16 input time points
+```
+
+## Step 5: Preparing Data for LSTM Application
+
+```{r}
+Trainlist <- Trainset %>% 
+  group_by(ID) %>%
+  # (1) Imputation
+  mutate(across(69:88, ~if_else(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  ungroup() %>%
+  # (2.1) Scaling for ordinal scales
+  mutate(across(70:86, ~MinMax_Scaler(., Min = 1, Max = 5))) %>%
+  # (2.2) Scaling for none ordinal scales
+  mutate(across(87:89, ~MinMax_Scaler(.))) %>%
+  # (3) Moving Windows
+  Sequence_Splicer(n_timepoints_in = lookback_window, 
+                   c_iv = 2:ncol(Trainset), 
+                   c_av = ncol(Trainset), 
+                   n_timepoints_out = Timepoints_to_forecast)
+
+Testlist <- Testset %>% 
+  group_by(ID) %>%
+  # (1) Imputation
+  mutate(across(69:88, ~if_else(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  ungroup() %>%
+  # (2.1) Scaling for ordinal scales
+  mutate(across(70:86, ~MinMax_Scaler(., Min = 1, Max = 5))) %>%
+  # (2.2) Scaling for none ordinal scales
+  mutate(across(87:89, ~MinMax_Scaler(.))) %>%
+  # (3) Moving Windows
+  Sequence_Splicer(n_timepoints_in = lookback_window, 
+                   c_iv = 2:ncol(Testset), 
+                   c_av = ncol(Testset), 
+                   n_timepoints_out = Timepoints_to_forecast)
+
+```
+
+## Step 6: Model Construction
+
+```{r}
+InputDimensions <- dim(Trainlist[[1]])[2:3]
+
+LSTM_NN <- Build_LSTM(Neurons = Neurons, 
+                      input_shape = InputDimensions, 
+                      lstm_layers = NoLSTMLayers, 
+                      dense_layers = NoDenseLayers, 
+                      ActivationFunction = AF, 
+                      recurrent_activation_function = Recurrent_AF, 
+                      dropout_rate = DropoutRate, 
+                      output_dimension = Timepoints_to_forecast)
+
+```
+
+## Step 7: Model Fitting
+
+Monitor:
+
+```{r}
+early_stopping <- callback_early_stopping(
+  monitor = "val_r2",
+  patience = 100,
+  mode = "max",
+  restore_best_weights = TRUE
+)
+```
+
+```{r}
+LearnCurve <- fit(LSTM_NN,
+    x = Trainlist[[1]],
+    y = Trainlist[[2]],
+    batch_size = BatchSize,
+    epochs = 1000,
+    callbacks = list(early_stopping),
+    validation_data = Testlist,
+    verbose = 2)
+```
+
+Visualize Learn Curve
+
+```{r}
+Plot1 <- as.data.frame(LearnCurve[2]) %>%
+  mutate(Epoch = 1:n()) %>%
+  pivot_longer(cols = c(1, 3), 
+               names_to = "CV_Type",
+               values_to = "Loss") %>%
+  mutate(Loss = sqrt(Loss)) %>%
+  ggplot(aes(x = Epoch, y = Loss, col = CV_Type)) +
+  geom_line(linewidth = 1.25) +
+  scale_y_continuous(limits = c(0, 0.5)) +
+  scale_color_manual(labels = c("Training RMSE", "Test RMSE"),
+                     values = c("#56B4E9", "#009E73")) + 
+  theme(legend.title = element_blank(), 
+        legend.position = "bottom") +
+  jtools::theme_apa(legend.pos = "bottom")
+
+
+Plot2 <- as.data.frame(LearnCurve[2]) %>%
+  mutate(Epoch = 1:n()) %>%
+  pivot_longer(cols = c(2, 4), 
+               names_to = "CV_Type",
+               values_to = "Performance") %>%
+  ggplot(aes(x = Epoch, y = Performance, col = CV_Type)) +
+  geom_line(linewidth = 1.25) +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_color_manual(labels = c("Training R²", "Test R²"), 
+                       values = c("#56B4E9", "#009E73")) + 
+  theme(legend.title = element_blank(), 
+        legend.position = "bottom") +
+  jtools::theme_apa(legend.pos = "bottom")
+
+
+
+Plot <- gridExtra::grid.arrange(Plot1, Plot2, ncol = 2)
+
+Path <- paste0(here(), "/03_figures/TrainingCycles.png")
+ggsave(plot = Plot, filename = Path, device = "png", 
+       height = 6, width = 10)
+Plot
+
+Performance_Plot <- plot(LearnCurve)
+Path <- paste0(here(), "/03_figures/DefaultTrainingCycles.png")
+ggsave(plot = Performance_Plot, filename = Path, device = "png")
+
+Performance_Plot
+```
+
+## Step 8: Forecast
+
+```{r}
+Forecast <- predict(LSTM_NN, Testlist[[1]], verbose = 0)
+
+head(Forecast)
+```
+
+```{r}
+Pred_List <- list()
+
+for(i in 1:5){
+  Indice <- (i+(7*(i-1))):(i+23 + (7 * (i-1)))
+  Preds <- EMA_Data %>% 
+  group_by(ID) %>% 
+  slice(Indice) %>%
+  mutate(across(69:88, ~if_else(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  ungroup() %>%
+  mutate(across(70:86, ~MinMax_Scaler(., Min = 1, Max = 5))) %>%
+  mutate(across(87:89, ~MinMax_Scaler(.))) %>%
+  Sequence_Splicer(n_timepoints_in = lookback_window, 
+                   c_iv = 2:ncol(Trainset), 
+                   c_av = ncol(Trainset), 
+                   n_timepoints_out = Timepoints_to_forecast)
+  
+  Pred_List[[i]] <- as.data.frame(predict(LSTM_NN, Preds[[1]], verbose = 0))
+  }
+
+############## Forecast
+df <- EMA_Data %>% 
+  group_by(ID) %>% 
+  slice(41:56) %>%
+  mutate(across(69:88, ~if_else(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  mutate(across(69:88, ~if_else(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  ungroup() %>%
+  # (2.1) Scaling for ordinal scales
+  mutate(across(70:86, ~MinMax_Scaler(., Min = 1, Max = 5))) %>%
+  # (2.2) Scaling for none ordinal scales
+  mutate(across(87:89, ~MinMax_Scaler(.)))
+
+
+IDs <- unique(df$ID)
+X <- array(0, dim = c(length(IDs), lookback_window, ncol(df)-1))
+for(p in 1:length(IDs)){
+    df_spliced <- df[df$ID == IDs[p], ]
+    seq_x <- df_spliced[, 2:89, drop = FALSE]
+      for(j in 1:ncol(seq_x)){
+        X[p, , j] <- unlist(seq_x[, j])}
+}
+
+
+Pred_List[[6]] <- as.data.frame(predict(LSTM_NN, X, verbose = 0))
+#################################################
+
+
+TrainMinMaxs <- EMA_Data %>%
+  group_by(ID) %>%
+  slice(1:48) %>%
+  ungroup() %>%
+  summarise(TrainMins = min(DepressionScore, na.rm = T),
+            TrainMaxs = max(DepressionScore, na.rm = T))
+
+TestMinMaxs <- EMA_Data %>%
+  group_by(ID) %>%
+  slice(32:56) %>%
+  ungroup() %>%
+  summarise(TestMins = min(DepressionScore, na.rm = T),
+            TestMaxs = max(DepressionScore, na.rm = T))
+
+CalibrationFrame <- as.data.frame(matrix(0, nrow = 69, ncol = 16))
+
+Path <- paste0(here(), "/01_data/UncertaintyValues.csv")
+Uncertainties <- read.csv(Path)[, -1]
+
+
+PredictionFrame <- bind_cols(CalibrationFrame, Pred_List, TrainMinMaxs, TestMinMaxs) %>%
+  mutate(across(17:48, ~(. * (TrainMaxs - TrainMins) + TrainMins)),
+         across(49:64, ~(. * (TestMaxs - TestMins) + TestMins))) %>%
+  select(1:64) %>%
+  rename_with(~ paste("Timepoint", 1:64), 1:64) %>%
+  mutate(ID = unique(EMA_Data$ID)) %>%
+  pivot_longer(cols = 1:64,
+               names_to = "Timepoint",
+               values_to = "Predicted") %>%
+  inner_join(Uncertainties, by = c("ID", "Timepoint")) %>%
+  mutate(UpperBand = Predicted + (L2_SE * 1.96),
+         LowerBand = Predicted - (L2_SE * 1.96),
+         People = rep(paste("Person", 1:69), each = 64),
+         Timepoint = as.numeric(str_extract(Timepoint, "\\d+")))
+
+  
+PredictionFrame <- EMA_Data %>%
+  select(ID, DepressionScore) %>%
+  mutate(People = rep(paste("Person", 1:69), each = 56),
+         Timepoint = rep(1:56, times = 69)) %>%
+  group_by(People) %>%
+  mutate(Observed = ifelse(is.na(DepressionScore), 
+                           mean(DepressionScore, na.rm = T), 
+                           DepressionScore)) %>%
+  select(!c(ID, DepressionScore)) %>%
+  ungroup() %>%
+  complete(People, Timepoint = rep(1:64, times = 69), 
+           fill = list(Observed = 0)) %>%
+  arrange(People, Timepoint) %>%
+  inner_join(PredictionFrame, by = c("People", "Timepoint"))
+
+######################## Short Check which people to choose for zooming in plot
+PredictionFrame %>%
+  group_by(People) %>%
+  slice(49:56) %>%
+  pivot_longer(cols = c(3,5),
+               names_to = "Type",
+               values_to = "DepressionScore") %>%
+  ggplot(aes(x = as.numeric(Timepoint), y = DepressionScore, col = Type)) +
+  geom_line() +
+  facet_wrap(~People)
+##########################
+
+Persons <- c(9, 54, 7, 36)
+
+
+TrainPerformance <- PredictionFrame %>%
+  filter(People %in% c(paste("Person", Persons))) %>%
+  group_by(People) %>%
+  slice(17:48) %>%
+  summarise(RMSE = sqrt(mean((Predicted -  Observed)^2)),
+            RSS = sum((Predicted - mean(Observed))^2),
+            TSS = sum((Observed - mean(Observed))^2),
+            R2 = RSS / TSS)
+
+TestPerformance <- PredictionFrame %>%
+  group_by(People) %>%
+  slice(48:56) %>%
+  filter(People %in% c(paste("Person", Persons))) %>%
+  summarise(RMSE = sqrt(mean((Predicted -  Observed)^2)),
+            RSS = sum((Predicted - mean(Predicted))^2),
+            TSS = sum((Observed - mean(Observed))^2),
+            R2 = RSS / TSS)
+
+
+PlotLabel1 <- "Calibration"
+PlotLabel2 <- "Training"
+PlotLabel3 <- "Testing"
+PlotLabel4 <- "Forecast"
+
+TrainRMSE <- paste("Train RMSE:", round(TrainPerformance$RMSE, 2))
+TrainR <- paste("Train R²:", round(TrainPerformance$R2, 2))
+
+TestRMSE <- paste("Test RMSE:", round(TestPerformance$RMSE, 2))
+TestR <- paste("Test R²:", round(TestPerformance$R2, 2))
+
+text_data <- data.frame(People = rep(factor(paste("Person", Persons), 
+                                        levels = paste("Person", Persons)),
+                                     times = 4),
+          DepressionScore = rep(c(3, 1), each = 4, times = 2),
+          Timepoint = rep(c(33, 53), each = 8),
+          lab = c(TrainRMSE, TrainR, TestRMSE, TestR),
+          Type = "Observed")
+
+
+Plot <- PredictionFrame %>%
+  pivot_longer(cols = c(3, 5),
+               names_to = "Type",
+               values_to = "DepressionScore") %>%
+  filter(People %in% c(paste("Person", Persons))) %>%
+  mutate(People = factor(People, levels = paste("Person", Persons))) %>%
+  group_by(People, Type) %>%
+  mutate(LowerBand = ifelse(row_number() <= 48, 0, LowerBand),
+         UpperBand = ifelse(row_number() <= 48, 0, UpperBand)) %>%
+  ggplot(aes(x = as.numeric(Timepoint), y = DepressionScore, col = Type)) +
+  geom_line(linewidth = 1.15) +
+  geom_ribbon(aes(ymin = LowerBand, ymax = UpperBand), alpha = 0.05, linetype = 2) +
+  scale_y_continuous(name = "EMA Depression Score", 
+                     limits = c(0.2, 26)) +
+  scale_x_continuous(name = "Timepoint", 
+                     limits = c(1, 64)) +
+  scale_color_manual(values = c("#56B4E9", "#009E73")) +
+  geom_vline(xintercept = 17, col = "black", linewidth = 1.25) +
+  geom_vline(xintercept = 49, col = "black", linewidth = 1.25) +
+  geom_vline(xintercept = 56, col = "black", linewidth = 1.25) +
+  annotate("text", x = 8, y = 21, label = PlotLabel1, size = 6.25) +
+  annotate("text", x = 33, y = 21, label = PlotLabel2, size = 6.25) +
+  annotate("text", x = 52.5, y = 21, label = PlotLabel3, size = 6.25) +
+  annotate("text", x = 60, y = 21, label = PlotLabel4, size = 6.25) +
+  jtools::theme_apa(legend.pos = "bottom") +
+  facet_wrap(~People, nrow = 4) +
+#  geom_text(data = text_data,  aes(x = as.numeric(Timepoint), y = DepressionScore, label = lab), size = 6.25, col = "black") +
+  theme(axis.title.x = element_text(size = 24),     # adjust size of axis titles
+        axis.title.y = element_text(size = 24),
+        axis.text = element_text(size = 22),      # adjust size of axis tick labels
+        axis.text.x = element_text(size = 22),   # adjust size of x-axis tick labels
+        axis.text.y = element_text(size = 22),   # adjust size of y-axis tick labels
+        legend.title = element_text(size = 22),   # adjust size of legend title
+        legend.text = element_text(size = 20),    # adjust size of legend labels
+        strip.text = element_text(size = 24),     # adjust size of facet labels
+        plot.title = element_text(size = 26),     # adjust size of plot title (if applicable)
+        strip.text.x = element_text(size = 22))   # adjust size of facet titles (x-axis)
+
+Path <- paste0(here(), "/03_figures/CoursePrediction.png")
+ggsave(plot = Plot, filename = Path, device = "png", width = 24, height = 22)
+Plot
+```
+
+## Step 9 (Optional): Hyperparameter Optimization
+
+```{r, echo = TRUE, eval = FALSE}
+Path <- paste0(here(), "/01_data/Hyperparameter Tuning")
+
+tfruns::tuning_run(file = "03_HyperparameterTuning.R", 
+                   runs_dir = Path, 
+                   sample = 0.2,
+                   flags = list(
+                     "Neurons" = c(seq(10, 100, by = 30)),
+                     "LSTM_Layer" = c(1:6),
+                     "Dense_Layer" = c(1:2),
+                     "BatchSize" = c(8, 16, 32, 64),
+                     "Activation Function" = c("relu", "tanh", "gelu"),
+                     "Recurrent AF" = c("sigmoid", "tanh"),
+                     "Dropout" = seq(0, 0.9, by = 0.2)
+                   )
+)
+```
+
+## Step 10 (Optional): Uncertainty Quantification
+
+```{r, echo = TRUE, eval = F}
+Path <- paste0(here(), "/01_data/Multistep.csv")
+EMA_Data <- read.csv(Path, header = T)
+
+EMA_Data <- data.frame(ID = unique(EMA_Data$ID)) %>%
+  bind_cols(as.data.frame(contr.sum(69))) %>%
+  inner_join(EMA_Data)
+
+Original_IDs <- unique(EMA_Data$ID)
+
+early_stopping <- callback_early_stopping(
+  monitor = "val_r2",
+  patience = 100,
+  mode = "max",
+  restore_best_weights = TRUE
+)
+
+bootstrap_fn <- function(b){
+  Start <- Sys.time()
+  Bootstrap_IDs <- sample(Original_IDs, replace = T)
+  Boot_List <- list()
+  
+  # Generate Bootstrap Samples
+  for(person in 1:length(Original_IDs)){
+    Boot_List[[person]] <- EMA_Data[EMA_Data$ID == Bootstrap_IDs[person], ]
+  }
+  
+  # Bind together and build new person variable
+  Bootstrap_Sample <- bind_rows(Boot_List) %>%
+    mutate(ID = rep(paste("Person", 1:69), each = 56))
+  
+  Knife_List <- list()
+  # Delete-1 jackknife
+  for(knife in 1:1){
+    knife <- 24
+  Bootstrap_Sample <- Bootstrap_Sample %>%
+    group_by(ID) %>%
+    mutate(across(69:88, ~if_else(row_number() == knife, NA, .)))
+  
+  # Step 4: Split Data
+  Trainset <- Bootstrap_Sample %>% group_by(ID) %>% slice(1:48)
+  Testset <- Bootstrap_Sample %>% group_by(ID) %>% slice(33:56)
+  
+  # Step 5: Data Preparation
+  Trainlist <- Trainset %>% 
+  group_by(ID) %>%
+  # (1) Imputation
+  mutate(across(69:88, ~if_else(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  # (2) Scaling
+  mutate(across(69:88, ~MinMax_Scaler(.))) %>%
+  # (3) Moving Windows
+  Sequence_Splicer(n_timepoints_in = lookback_window, 
+                   c_iv = 2:ncol(Trainset), 
+                   c_av = ncol(Trainset), 
+                   n_timepoints_out = Timepoints_to_forecast)
+
+
+  Testlist <- Testset %>% 
+    group_by(ID) %>%
+    # (1) Imputation
+    mutate(across(69:88, ~if_else(is.na(.), mean(., na.rm = TRUE), .))) %>%
+    # (2) Scaling
+    mutate(across(69:88, ~MinMax_Scaler(.))) %>%
+    # (3) Moving Windows
+    Sequence_Splicer(n_timepoints_in = lookback_window, 
+                   c_iv = 2:ncol(Testset), 
+                   c_av = ncol(Testset), 
+                   n_timepoints_out = Timepoints_to_predict)
+  
+  # Step 6: Model Construction
+  InputDimensions <- dim(Trainlist[[1]])[2:3]
+
+  LSTM_NN <- Build_LSTM(Neurons = Neurons, 
+                      input_shape = InputDimensions, 
+                      lstm_layers = NoLSTMLayers, 
+                      dense_layers = NoDenseLayers, 
+                      ActivationFunction = AF, 
+                      recurrent_activation_function = Recurrent_AF, 
+                      dropout_rate = DropoutRate, 
+                      output_dimension = Timepoints_to_predict)
+  
+  # Step 7: Model Fitting
+  fit(LSTM_NN,
+    x = Trainlist[[1]],
+    y = Trainlist[[2]],
+    batch_size = BatchSize,
+    epochs = 1000,
+    callbacks = list(early_stopping),
+    validation_data = Testlist,
+    verbose = 0)
+  
+  # Step 8: Prediction
+  Pred_List <- list()
+
+for(i in 1:5){
+  Indice <- (i+(7*(i-1))):(i+23 + (7 * (i-1)))
+  Preds <- Bootstrap_Sample %>% 
+  group_by(ID) %>% 
+  slice(Indice) %>%
+  mutate(across(69:88, ~if_else(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  mutate(across(69:88, ~MinMax_Scaler(.))) %>%
+  Sequence_Splicer(n_timepoints_in = lookback_window, 
+                   c_iv = 2:ncol(Trainset), 
+                   c_av = ncol(Trainset), 
+                   n_timepoints_out = Timepoints_to_predict)
+  
+  Pred_List[[i]] <- as.data.frame(predict(LSTM_NN, Preds[[1]], verbose = 0))
+  }
+
+############## Forecast
+
+df <- Bootstrap_Sample %>% 
+  group_by(ID) %>% 
+  slice(41:56) %>%
+  # (1) Imputation
+  mutate(across(69:88, ~if_else(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  # (2) Scaling
+  mutate(across(69:88, ~MinMax_Scaler(.)))
+
+IDs <- unique(df$ID)
+X <- array(0, dim = c(length(IDs), lookback_window, ncol(df)-1))
+for(p in 1:length(IDs)){
+    df_spliced <- df[df$ID == IDs[p], ]
+    seq_x <- df_spliced[, 2:89, drop = FALSE]
+      for(j in 1:ncol(seq_x)){
+        X[p, , j] <- unlist(seq_x[, j])}
+}
+
+Pred_List[[6]] <- as.data.frame(predict(LSTM_NN, X, verbose = 0))
+#################################################
+
+TrainMinMaxs <- Bootstrap_Sample %>%
+  group_by(ID) %>%
+  slice(1:48) %>%
+  summarise(TrainMins = min(DepressionScore, na.rm = T),
+            TrainMaxs = max(DepressionScore, na.rm = T))
+
+TestMinMaxs <- Bootstrap_Sample %>%
+  group_by(ID) %>%
+  slice(32:56) %>%
+  summarise(TestMins = min(DepressionScore, na.rm = T),
+            TestMaxs = max(DepressionScore, na.rm = T))
+
+
+Predictions <- as.data.frame(matrix(0, nrow = 69, ncol = 16)) %>%
+  bind_cols(Pred_List, TrainMinMaxs, TestMinMaxs) %>%
+    mutate(across(17:48, ~(. * (TrainMaxs - TrainMins) + TrainMins)),
+         across(49:64, ~(. * (TestMaxs - TestMins) + TestMins))) %>%
+  select(1:64) %>%
+  mutate(ID = Bootstrap_IDs) %>%
+  rename_with(~ paste("Timepoint", 1:64), 1:64) %>%
+  pivot_longer(cols = 1:64,
+               names_to = "Timepoint",
+               values_to = "Prediction") %>%
+  mutate(Bootstrap = b, 
+         Jackknife = knife)
+
+Knife_List[[knife]] <- Predictions
+
+Path1 <- paste0(here(), "/01_data/01_Uncertainty/")
+Path_Total <- paste0(Path1, "Bootstrap_", b, "_Jackknife_", knife, ".csv")
+write.csv(Predictions, file = Path_Total)
+
+  }
+  
+  return(bind_rows(Knife_List))
+  
+}
+
+UC_Samples <- list()
+r <- 1000
+for(b in 1:r){
+UC_Samples[[b]] <- bootstrap_fn(b)
+}
+
+TotalUncertainty <- bind_rows(UC_Samples)
+Path <- paste0(here(), "/01_data/Uncertainty.csv")
+write.csv(TotalUncertainty, file = Path)
+```

@@ -1,0 +1,111 @@
+---
+title: "02_PreliminarySteps"
+author: "Nedderhoff"
+---
+# Preliminary Steps: Loading libraries, Initial Data Handling and Missing Data
+
+```{r}
+packages <- c("tidyverse", "here", "jtools")
+
+PackageManager <- function(x){
+  pkg_avail <- nzchar(system.file(package = x))
+
+  if(pkg_avail){
+  library(x, character.only = TRUE)
+}
+  else{install.packages(x)
+     library(x, character.only = TRUE)}
+}
+
+apply(as.matrix(packages), MARGIN = 1, FUN = PackageManager)
+setwd(getwd())
+```
+
+Reading in data
+
+```{r}
+# Read in raw data
+load(url("https://osf.io/download/3dxuq"))
+```
+
+Visualizing time points
+
+```{r}
+rawdata %>%
+  group_by(ID) %>%
+  summarise(Count = n())  %>%
+  ggplot(aes(x = as.character(Count))) + 
+  geom_bar(fill = "black") + 
+  scale_y_continuous(name = "Frequency") +
+  scale_x_discrete(name = "Number of Timepoints")
+```
+
+As most participants have 56 time points, we also use only 56 time points
+
+```{r}
+NoTimepoints <- 56
+
+# Only keep users with at least 56 timepoints
+EMA_Depr_dat <- rawdata %>%
+  group_by(ID) %>%
+  # First filter out participants with less than 56 time points ...
+  mutate(Count = n()) %>%
+  filter(Count >= NoTimepoints) %>%
+  # ... and only use 56 time points of those with more than 56 time points
+  slice(1:NoTimepoints) %>%
+  # ... and remove unnecessary variables
+  select(!c(Scheduled, Issued, Response, Duration, Day, Count, time))
+```
+
+Missing values inspection
+
+```{r}
+Missingness <- EMA_Depr_dat %>%
+  group_by(ID) %>%
+  reframe(Missings = (sum(is.na(across(2:19))) / (17 * NoTimepoints)) * 100) %>%
+  arrange(desc(Missings)) %>%
+  ggplot(aes(x = 1:77, y = Missings)) +
+  geom_line(linewidth = 1.15) +
+  scale_x_continuous(name = "Person") +
+  scale_y_continuous(name = "Missingness in Percentage", limits = c(0, 100)) +
+  geom_hline(yintercept = 25) +
+  jtools::theme_apa(legend.pos = "bottom") +
+  theme(axis.title.x = element_text(size = 24),     # adjust size of axis titles
+        axis.title.y = element_text(size = 24),
+        axis.text = element_text(size = 22),      # adjust size of axis tick labels
+        axis.text.x = element_text(size = 22),   # adjust size of x-axis tick labels
+        axis.text.y = element_text(size = 22),   # adjust size of y-axis tick labels
+        legend.title = element_text(size = 22),   # adjust size of legend title
+        legend.text = element_text(size = 20),    # adjust size of legend labels
+        strip.text = element_text(size = 24),     # adjust size of facet labels
+        plot.title = element_text(size = 26),     # adjust size of plot title (if applicable)
+        strip.text.x = element_text(size = 22))   # adjust size of facet titles (x-axis)
+
+
+Path <- paste0(here(), "/03_figures/Missingness.png")
+ggsave(plot = Missingness, filename = Path, device = "png", width = 24, height = 22)
+Missingness
+```
+
+Remove persons with too much missings and calculate dependent depression score
+
+```{r}
+EMA_Depr_dat <- EMA_Depr_dat %>%
+  group_by(ID) %>%
+  mutate(Missings = (sum(is.na(across(2:19))) / (17 * NoTimepoints)) * 100) %>%
+  # Remove user with more than 25% missings (arbitrarily chosen)
+  filter(Missings <= 25) %>%
+  # ... and generate the dependent variable
+  mutate(DepressionScore = Q5 + Q6 + Q7 + Q9 + Q11) %>%
+  # ... and remove missingness variable
+  select(!Missings) %>%
+  # ... and ungroup()
+  ungroup()
+```
+
+Save data for multistep time series
+
+```{r}
+Path <- paste0(here(),"/01_data/CV_MT.csv")
+write.csv(EMA_Depr_dat, file = Path, row.names = F)
+```

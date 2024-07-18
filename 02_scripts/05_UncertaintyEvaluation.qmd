@@ -1,0 +1,40 @@
+---
+title: "Uncertainty Calculator"
+format: html
+editor: visual
+---
+
+
+```{r}
+library(here)
+library(tidyverse)
+
+Path <- paste0(here(), "/01_data/01_Uncertainty")
+datasets <- list.files(Path)
+Uncertainty_List <- list()
+
+for (i in 1:length(datasets)){
+SpecificDataset <- datasets[i]
+Splitter <- strsplit(SpecificDataset, split = "_")
+CSV <- paste0(Path, "/", SpecificDataset)
+Uncertainty_List[[i]] <- read.csv(file = CSV)[, -1]
+}
+
+# Put data frame together
+Uncertainty_Frame <- bind_rows(Uncertainty_List)
+
+
+
+
+# Calculation
+Uncertainties <- Uncertainty_Frame %>%
+  group_by(Bootstrap, ID, Timepoint) %>%
+  filter(!c(Prediction < 0 | Prediction > 100)) %>%
+  summarise(Squared_SE = var(Prediction, na.rm = T)) %>%
+  ungroup() %>%
+  group_by(ID, Timepoint) %>%
+  summarise(L2_SE = sqrt(mean(Squared_SE)))
+
+Path <- paste0(here(), "/01_data/UncertaintyValues.csv")
+write.csv(Uncertainties, file = Path)
+```
